@@ -42,6 +42,7 @@ func main() {
 type visitor struct {
 	depth       int
 	currentTest string
+	path string
 }
 
 func (v visitor) Visit(n ast.Node) ast.Visitor {
@@ -63,8 +64,8 @@ func (v visitor) Visit(n ast.Node) ast.Visitor {
 		if inRetry(node.Fun) {
 			retryDepth = v.depth
 		}
-		if retryDepth > 0 && callsT(node.Fun) {
-			fmt.Printf("callsT: adding '%s' to broken\n", v.currentTest)
+		if retryDepth > 0 && tCallsFailer(node.Fun) {
+			fmt.Printf("\t\t used 't' in retry: adding '%s' to broken\n", v.currentTest)
 			broken = append(broken, v.currentTest)
 			break
 		}
@@ -73,6 +74,7 @@ func (v visitor) Visit(n ast.Node) ast.Visitor {
 		// - require.New(t) was called earlier
 		if retryDepth > 0 && usesRequire(node.Fun) {
 			if usesT(node) || requireDepth > 0 {
+				fmt.Printf("\t\t require uses 't': adding '%s' to broken\n", v.currentTest)
 				broken = append(broken, v.currentTest)
 			}
 		}
@@ -80,7 +82,7 @@ func (v visitor) Visit(n ast.Node) ast.Visitor {
 		name := node.Name.Name
 
 		// Don't filter to test functions, since issue can be in helper func
-		fmt.Printf("Processing: %s\n", name)
+		fmt.Printf("\t Processing: %s\n", name)
 		v.currentTest = name
 	}
 	v.depth++
@@ -135,6 +137,9 @@ func inRequire(ce *ast.CallExpr) bool {
 	if !ok {
 		return false
 	}
+	if len(ce.Args) == 0 {
+		return false
+	}
 	firstArg, ok := ce.Args[0].(*ast.Ident)
 	if !ok {
 		return false
@@ -145,8 +150,8 @@ func inRequire(ce *ast.CallExpr) bool {
 	return false
 }
 
-// callsT checks if expression is a call to t.[Fail|Fatal|Error]
-func callsT(fun ast.Expr) bool {
+// tCallsFailer checks if expression is a call to t.[Fail|Fatal|Error]
+func tCallsFailer(fun ast.Expr) bool {
 	function, ok := fun.(*ast.SelectorExpr)
 	if !ok {
 		return false
@@ -191,6 +196,7 @@ func usesT(ce *ast.CallExpr) bool {
 }
 
 func walkDir(path string) error {
+	fmt.Println(path)
 	return filepath.Walk(path, visitFile)
 }
 
@@ -198,10 +204,11 @@ func visitFile(path string, f os.FileInfo, err error) error {
 	if err != nil {
 		return err
 	}
-	if isTestFile(f) {
-		f, err := parser.ParseFile(fset, f.Name(), nil, parser.ParseComments)
+	if isTestFile(path, f) {
+		fmt.Printf("Visiting: %s\n", path)
+		f, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
 		if err != nil {
-			fmt.Printf("failed to parse '%s' (skipping): %v", f.Name, err)
+			fmt.Printf("failed to parse (skipping): %v", err)
 		}
 		// Only process files importing sdk/testutil/retry
 		if importsRetry(f) {
@@ -212,9 +219,8 @@ func visitFile(path string, f os.FileInfo, err error) error {
 	return nil
 }
 
-func isTestFile(f os.FileInfo) bool {
-	name := f.Name()
-	return !f.IsDir() && !strings.HasPrefix(name, ".") && strings.HasSuffix(name, "_test.go")
+func isTestFile(path string, f os.FileInfo) bool {
+	return !f.IsDir() && strings.Contains(path, "test")
 }
 
 func report(err error) {
