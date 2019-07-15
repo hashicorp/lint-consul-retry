@@ -23,9 +23,9 @@ var (
 		"Fatal":   true,
 		"Fatalf":  true,
 	}
-	retryPath    = "\"github.com/hashicorp/consul/sdk/testutil/retry\""
-	retryDepth   = 0
-	requireDepth = 0
+	retryPath  = "\"github.com/hashicorp/consul/sdk/testutil/retry\""
+	retryDepth = 0     // tracks depth of current retry.Run call
+	newRequire = false // tracks whether require.New(t) was called
 )
 
 func main() {
@@ -36,33 +36,35 @@ func main() {
 	if err := walkDir(dir); err != nil {
 		report(err)
 	}
+	if len(broken) > 0 {
+		exitCode = 1
+	}
 	os.Exit(exitCode)
 }
 
 type visitor struct {
 	depth       int
 	currentTest string
-	path string
+	path        string
 }
 
 func (v visitor) Visit(n ast.Node) ast.Visitor {
-	// fmt.Printf("%s%T\n", strings.Repeat(" ", v.depth), n)
+	// fmt.Printf("%s%T, retry: %d req: %t\n", strings.Repeat(" ", v.depth), n, retryDepth, newRequire)
 
 	// Walk uses DFS so reset when we pop back up
 	if retryDepth > 0 && v.depth <= retryDepth {
 		retryDepth = 0
 	}
-	if requireDepth > 0 && v.depth <= requireDepth {
-		requireDepth = 0
-	}
 
 	switch node := n.(type) {
 	case *ast.CallExpr:
 		if inRequire(node) {
-			requireDepth = v.depth
+			newRequire = true
+			fmt.Printf("\t\t called require.New(t) at %d\n", v.depth)
 		}
 		if inRetry(node.Fun) {
 			retryDepth = v.depth
+			fmt.Printf("\t\t called retry.Run at %d\n", retryDepth)
 		}
 		if retryDepth > 0 && tCallsFailer(node.Fun) {
 			fmt.Printf("\t\t used 't' in retry: adding '%s' to broken\n", v.currentTest)
@@ -73,7 +75,7 @@ func (v visitor) Visit(n ast.Node) ast.Visitor {
 		// - t is an argument to require func
 		// - require.New(t) was called earlier
 		if retryDepth > 0 && usesRequire(node.Fun) {
-			if usesT(node) || requireDepth > 0 {
+			if newRequire || usesT(node) {
 				fmt.Printf("\t\t require uses 't': adding '%s' to broken\n", v.currentTest)
 				broken = append(broken, v.currentTest)
 			}
@@ -84,6 +86,7 @@ func (v visitor) Visit(n ast.Node) ast.Visitor {
 		// Don't filter to test functions, since issue can be in helper func
 		fmt.Printf("\t Processing: %s\n", name)
 		v.currentTest = name
+		newRequire = false // Will only call require.New once per function call
 	}
 	v.depth++
 	return v
@@ -225,5 +228,5 @@ func isTestFile(path string, f os.FileInfo) bool {
 
 func report(err error) {
 	scanner.PrintError(os.Stderr, err)
-	exitCode = 2
+	exitCode = 1
 }
