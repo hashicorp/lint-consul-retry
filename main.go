@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"go/ast"
 	"go/parser"
-	"go/scanner"
 	"go/token"
 	"os"
 	"path/filepath"
@@ -12,7 +11,7 @@ import (
 )
 
 var (
-	broken   = make([]string, 0)
+	broken   = make(map[string]bool, 0) // Stored in a map for deduplication
 	exitCode = 0
 	fset     = token.NewFileSet()
 	failers  = map[string]bool{
@@ -31,13 +30,16 @@ var (
 func main() {
 	dir, err := os.Getwd()
 	if err != nil {
-		report(err)
+		os.Stderr.WriteString(fmt.Sprintf("failed to get cwd: %v", err))
+		os.Exit(1)
 	}
-	if err := walkDir(dir); err != nil {
-		report(err)
-	}
+	walkDir(dir)
 	if len(broken) > 0 {
 		exitCode = 1
+		os.Stderr.WriteString("Found tests using testing.T inside retry.Run:\n")
+		for t := range broken {
+			os.Stderr.WriteString(fmt.Sprintf("  %s\n", t))
+		}
 	}
 	os.Exit(exitCode)
 }
@@ -60,15 +62,12 @@ func (v visitor) Visit(n ast.Node) ast.Visitor {
 	case *ast.CallExpr:
 		if inRequire(node) {
 			newRequire = true
-			fmt.Printf("\t\t called require.New(t) at %d\n", v.depth)
 		}
 		if inRetry(node.Fun) {
 			retryDepth = v.depth
-			fmt.Printf("\t\t called retry.Run at %d\n", retryDepth)
 		}
 		if retryDepth > 0 && tCallsFailer(node.Fun) {
-			fmt.Printf("\t\t used 't' in retry: adding '%s' to broken\n", v.currentTest)
-			broken = append(broken, v.currentTest)
+			broken[v.currentTest] = true
 			break
 		}
 		// Flag if we're using require in a retry if:
@@ -76,15 +75,13 @@ func (v visitor) Visit(n ast.Node) ast.Visitor {
 		// - require.New(t) was called earlier
 		if retryDepth > 0 && usesRequire(node.Fun) {
 			if newRequire || usesT(node) {
-				fmt.Printf("\t\t require uses 't': adding '%s' to broken\n", v.currentTest)
-				broken = append(broken, v.currentTest)
+				broken[v.currentTest] = true
 			}
 		}
 	case *ast.FuncDecl:
 		name := node.Name.Name
 
 		// Don't filter to test functions, since issue can be in helper func
-		fmt.Printf("\t Processing: %s\n", name)
 		v.currentTest = name
 		newRequire = false // Will only call require.New once per function call
 	}
@@ -199,24 +196,22 @@ func usesT(ce *ast.CallExpr) bool {
 }
 
 func walkDir(path string) error {
-	fmt.Println(path)
 	return filepath.Walk(path, visitFile)
 }
 
 func visitFile(path string, f os.FileInfo, err error) error {
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to visit '%s', %v", err)
 	}
 	if isTestFile(path, f) {
-		fmt.Printf("Visiting: %s\n", path)
-		f, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
+		tree, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
 		if err != nil {
-			fmt.Printf("failed to parse (skipping): %v", err)
+			return nil
 		}
 		// Only process files importing sdk/testutil/retry
-		if importsRetry(f) {
+		if importsRetry(tree) {
 			v := visitor{}
-			ast.Walk(v, f)
+			ast.Walk(v, tree)
 		}
 	}
 	return nil
@@ -224,9 +219,4 @@ func visitFile(path string, f os.FileInfo, err error) error {
 
 func isTestFile(path string, f os.FileInfo) bool {
 	return !f.IsDir() && strings.Contains(path, "test")
-}
-
-func report(err error) {
-	scanner.PrintError(os.Stderr, err)
-	exitCode = 1
 }
