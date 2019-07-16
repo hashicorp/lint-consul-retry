@@ -61,7 +61,7 @@ func (v visitor) Visit(n ast.Node) ast.Visitor {
 		if inRequire(node) {
 			newRequire = true
 		}
-		if inRetry(node.Fun) {
+		if inRetry(node) {
 			retryDepth = v.depth
 		}
 		if retryDepth > 0 && tCallsFailer(node.Fun) {
@@ -109,9 +109,9 @@ func importsRetry(file *ast.File) bool {
 	return false
 }
 
-// inRetry if an expression is a call to retry.Run()
-func inRetry(fun ast.Expr) bool {
-	function, ok := fun.(*ast.SelectorExpr)
+// inRetry if an expression is a call to retry.Run(t func(r *retry.R){...})
+func inRetry(ce *ast.CallExpr) bool {
+	function, ok := ce.Fun.(*ast.SelectorExpr)
 	if !ok {
 		return false
 	}
@@ -119,7 +119,16 @@ func inRetry(fun ast.Expr) bool {
 	if !ok {
 		return false
 	}
-	if pkg.Name == "retry" && function.Sel.Name == "Run" {
+	if !(pkg.Name == "retry" && function.Sel.Name == "Run") {
+		return false
+	}
+	lit, ok := ce.Args[1].(*ast.FuncLit)
+	if !ok {
+		return false
+	}
+	// Check for 'r' because 'retry.Run(t func(t *retry.R){...})' is valid
+	param := lit.Type.Params.List[0]
+	if param.Names[0].Name == "r" {
 		return true
 	}
 	return false
@@ -142,7 +151,10 @@ func inRequire(ce *ast.CallExpr) bool {
 	if !ok {
 		return false
 	}
-	if pkg.Name == "require" && function.Sel.Name == "New" && firstArg.Name == "t" {
+	if !(pkg.Name == "require" || pkg.Name == "assert") {
+		return false
+	}
+	if function.Sel.Name == "New" && firstArg.Name == "t" {
 		return true
 	}
 	return false
@@ -180,7 +192,7 @@ func usesRequire(fun ast.Expr) bool {
 	return false
 }
 
-// usesParam checks if t is first param of call expression
+// usesParam checks if param is first in a call expression
 func usesParam(param string, ce *ast.CallExpr) bool {
 	// t is always first arg to require when not using require.New
 	firstArg, ok := ce.Args[0].(*ast.Ident)
