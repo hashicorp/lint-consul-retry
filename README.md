@@ -6,16 +6,16 @@ Checks if `consul/sdk/testutil/retry.Run` uses `testing.T`.
 Examples:
 
 ```go
-require.New(t)
+require := require.New(t)
 
 retry.Run(t, func(r *retry.R) {
-  require.NotNill(err)
+  require.NotNil(err)
 }
 ```
 
 ```go
 retry.Run(t, func(r *retry.R) {
-  require.NotNill(t, err)
+  require.NotNil(t, err)
 }
 ```
 
