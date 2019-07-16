@@ -71,10 +71,10 @@ func (v visitor) Visit(n ast.Node) ast.Visitor {
 			break
 		}
 		// Flag if we're using require in a retry if:
+		// - require.New(t) was called earlier and assertion does not use 'r'
 		// - t is an argument to require func
-		// - require.New(t) was called earlier
 		if retryDepth > 0 && usesRequire(node.Fun) {
-			if newRequire || usesT(node) {
+			if (newRequire && !usesParam("r", node)) || usesParam("t", node) {
 				broken[v.currentTest] = true
 			}
 		}
@@ -182,14 +182,14 @@ func usesRequire(fun ast.Expr) bool {
 	return false
 }
 
-// usesT checks if t is first param of call expression
-func usesT(ce *ast.CallExpr) bool {
+// usesParam checks if t is first param of call expression
+func usesParam(param string, ce *ast.CallExpr) bool {
 	// t is always first arg to require when not using require.New
 	firstArg, ok := ce.Args[0].(*ast.Ident)
 	if !ok {
 		return false
 	}
-	if firstArg.Name == "t" {
+	if firstArg.Name == param {
 		return true
 	}
 	return false
@@ -205,7 +205,7 @@ func visitFile(path string, f os.FileInfo, err error) error {
 	}
 	if isTestFile(path, f) {
 		tree, _ := parser.ParseFile(fset, path, nil, parser.ParseComments)
-		
+
 		// Only process files importing sdk/testutil/retry
 		if importsRetry(tree) {
 			v := visitor{}
