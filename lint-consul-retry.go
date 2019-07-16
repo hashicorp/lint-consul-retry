@@ -51,8 +51,6 @@ type visitor struct {
 }
 
 func (v visitor) Visit(n ast.Node) ast.Visitor {
-	// fmt.Printf("%s%T, retry: %d req: %t\n", strings.Repeat(" ", v.depth), n, retryDepth, newRequire)
-
 	// Walk uses DFS so reset when we pop back up
 	if retryDepth > 0 && v.depth <= retryDepth {
 		retryDepth = 0
