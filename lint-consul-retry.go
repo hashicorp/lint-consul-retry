@@ -204,10 +204,8 @@ func visitFile(path string, f os.FileInfo, err error) error {
 		return fmt.Errorf("failed to visit '%s', %v", err)
 	}
 	if isTestFile(path, f) {
-		tree, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
-		if err != nil {
-			return nil
-		}
+		tree, _ := parser.ParseFile(fset, path, nil, parser.ParseComments)
+		
 		// Only process files importing sdk/testutil/retry
 		if importsRetry(tree) {
 			v := visitor{}
