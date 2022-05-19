@@ -119,13 +119,29 @@ func inRetry(ce *ast.CallExpr) bool {
 	if !ok {
 		return false
 	}
-	if !(pkg.Name == "retry" && function.Sel.Name == "Run") {
+
+	if pkg.Name != "retry" {
 		return false
 	}
-	lit, ok := ce.Args[1].(*ast.FuncLit)
-	if !ok {
+
+	var lit *ast.FuncLit
+	switch function.Sel.Name {
+	case "Run": // retry.Run(t, <FUNC>)
+		var ok bool
+		lit, ok = ce.Args[1].(*ast.FuncLit)
+		if !ok {
+			return false
+		}
+	case "RunWith": // retry.RunWith(<FAILER>, t, <FUNC>)
+		var ok bool
+		lit, ok = ce.Args[2].(*ast.FuncLit)
+		if !ok {
+			return false
+		}
+	default:
 		return false
 	}
+
 	// Check for 'r' because 'retry.Run(t func(t *retry.R){...})' is valid
 	param := lit.Type.Params.List[0]
 	if param.Names[0].Name == "r" {
