@@ -10,14 +10,14 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
 var (
-	broken   = make(map[string]bool, 0) // Stored in a map for deduplication
-	exitCode = 0
-	fset     = token.NewFileSet()
-	failers  = map[string]bool{
+	broken  = make(map[string]map[string]struct{}) // Stored in a map for deduplication file->test-><nop>
+	fset    = token.NewFileSet()
+	failers = map[string]bool{
 		"Error":   true,
 		"Errorf":  true,
 		"Fail":    true,
@@ -25,26 +25,68 @@ var (
 		"Fatal":   true,
 		"Fatalf":  true,
 	}
-	retryPath  = "\"github.com/hashicorp/consul/sdk/testutil/retry\""
+
 	retryDepth = 0     // tracks depth of current retry.Run call
 	newRequire = false // tracks whether require.New(t) was called
 )
 
+const (
+	retryPath = `"github.com/hashicorp/consul/sdk/testutil/retry"`
+)
+
 func main() {
+	exitCode, err := run()
+	if err != nil {
+		os.Stderr.WriteString(err.Error() + "\n")
+		os.Exit(1)
+	} else {
+		os.Exit(exitCode)
+	}
+}
+
+func run() (int, error) {
 	dir, err := os.Getwd()
 	if err != nil {
-		os.Stderr.WriteString(fmt.Sprintf("failed to get cwd: %v", err))
-		os.Exit(1)
+		return 0, fmt.Errorf("failed to get cwd: %w", err)
 	}
-	walkDir(dir)
+	if err := walkDir(dir); err != nil {
+		return 0, fmt.Errorf("failed to walk directory: %w", err)
+	}
 	if len(broken) > 0 {
-		exitCode = 1
 		os.Stderr.WriteString("Found tests using testing.T inside retry.Run:\n")
-		for t := range broken {
-			os.Stderr.WriteString(fmt.Sprintf("  %s\n", t))
+		for _, path := range keys(broken) {
+			rel, err := filepath.Rel(dir, path)
+			if err != nil {
+				rel = path // just skip truncation
+			}
+			os.Stderr.WriteString(fmt.Sprintf("  %s:\n", rel))
+
+			testList := broken[path]
+			for _, test := range keys(testList) {
+				os.Stderr.WriteString(fmt.Sprintf("    %s\n", test))
+			}
 		}
+		return 1, nil
 	}
-	os.Exit(exitCode)
+	return 0, nil
+}
+
+func keys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func rememberTest(path, test string) {
+	testList, ok := broken[path]
+	if !ok {
+		testList = make(map[string]struct{})
+		broken[path] = testList
+	}
+	testList[test] = struct{}{}
 }
 
 type visitor struct {
@@ -68,7 +110,7 @@ func (v visitor) Visit(n ast.Node) ast.Visitor {
 			retryDepth = v.depth
 		}
 		if retryDepth > 0 && tCallsFailer(node.Fun) {
-			broken[v.currentTest] = true
+			rememberTest(v.path, v.currentTest)
 			break
 		}
 		// Flag if we're using require in a retry if:
@@ -76,7 +118,7 @@ func (v visitor) Visit(n ast.Node) ast.Visitor {
 		// - t is an argument to require func
 		if retryDepth > 0 && usesRequire(node.Fun) {
 			if (newRequire && !usesParam("r", node)) || usesParam("t", node) {
-				broken[v.currentTest] = true
+				rememberTest(v.path, v.currentTest)
 			}
 		}
 	case *ast.FuncDecl:
@@ -96,7 +138,7 @@ func importsRetry(file *ast.File) bool {
 
 	for _, decl := range file.Decls {
 		if general, ok := decl.(*ast.GenDecl); ok {
-			specs = general.Specs
+			specs = append(specs, general.Specs...)
 		}
 	}
 	for _, spec := range specs {
@@ -230,20 +272,34 @@ func walkDir(path string) error {
 
 func visitFile(path string, f os.FileInfo, err error) error {
 	if err != nil {
-		return fmt.Errorf("failed to visit '%s', %v", err)
+		return fmt.Errorf("failed to visit '%s', %v", path, err)
 	}
-	if isTestFile(path, f) {
-		tree, _ := parser.ParseFile(fset, path, nil, parser.ParseComments)
 
-		// Only process files importing sdk/testutil/retry
-		if importsRetry(tree) {
-			v := visitor{}
-			ast.Walk(v, tree)
-		}
+	if !isGoTestFile(path, f) {
+		return nil
 	}
+
+	tree, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
+	if err != nil {
+		return fmt.Errorf("failed to parse test file '%s', %v", path, err)
+	}
+
+	// Only process files importing sdk/testutil/retry
+	if importsRetry(tree) {
+		v := visitor{path: path}
+		ast.Walk(v, tree)
+	}
+
 	return nil
 }
 
-func isTestFile(path string, f os.FileInfo) bool {
-	return !f.IsDir() && strings.Contains(path, "test")
+func isGoFile(path string, f os.FileInfo) bool {
+	if !f.Mode().IsRegular() {
+		return false
+	}
+	return strings.HasSuffix(path, ".go")
+}
+
+func isGoTestFile(path string, f os.FileInfo) bool {
+	return isGoFile(path, f) && strings.HasSuffix(path, "_test.go")
 }
