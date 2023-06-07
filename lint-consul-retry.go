@@ -10,11 +10,12 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
 var (
-	broken  = make(map[string]bool, 0) // Stored in a map for deduplication
+	broken  = make(map[string]map[string]struct{}) // Stored in a map for deduplication file->test-><nop>
 	fset    = token.NewFileSet()
 	failers = map[string]bool{
 		"Error":   true,
@@ -53,12 +54,39 @@ func run() (int, error) {
 	}
 	if len(broken) > 0 {
 		os.Stderr.WriteString("Found tests using testing.T inside retry.Run:\n")
-		for t := range broken {
-			os.Stderr.WriteString(fmt.Sprintf("  %s\n", t))
+		for _, path := range keys(broken) {
+			rel, err := filepath.Rel(dir, path)
+			if err != nil {
+				rel = path // just skip truncation
+			}
+			os.Stderr.WriteString(fmt.Sprintf("  %s:\n", rel))
+
+			testList := broken[path]
+			for _, test := range keys(testList) {
+				os.Stderr.WriteString(fmt.Sprintf("    %s\n", test))
+			}
 		}
 		return 1, nil
 	}
 	return 0, nil
+}
+
+func keys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func rememberTest(path, test string) {
+	testList, ok := broken[path]
+	if !ok {
+		testList = make(map[string]struct{})
+		broken[path] = testList
+	}
+	testList[test] = struct{}{}
 }
 
 type visitor struct {
@@ -82,7 +110,7 @@ func (v visitor) Visit(n ast.Node) ast.Visitor {
 			retryDepth = v.depth
 		}
 		if retryDepth > 0 && tCallsFailer(node.Fun) {
-			broken[v.currentTest] = true
+			rememberTest(v.path, v.currentTest)
 			break
 		}
 		// Flag if we're using require in a retry if:
@@ -90,7 +118,7 @@ func (v visitor) Visit(n ast.Node) ast.Visitor {
 		// - t is an argument to require func
 		if retryDepth > 0 && usesRequire(node.Fun) {
 			if (newRequire && !usesParam("r", node)) || usesParam("t", node) {
-				broken[v.currentTest] = true
+				rememberTest(v.path, v.currentTest)
 			}
 		}
 	case *ast.FuncDecl:

@@ -1,3 +1,3 @@
 module github.com/hashicorp/lint-consul-retry
 
-go 1.12
+go 1.19
