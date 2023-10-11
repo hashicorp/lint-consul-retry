@@ -25,9 +25,6 @@ var (
 		"Fatal":   true,
 		"Fatalf":  true,
 	}
-
-	retryDepth = 0     // tracks depth of current retry.Run call
-	newRequire = false // tracks whether require.New(t) was called
 )
 
 const (
@@ -93,42 +90,49 @@ type visitor struct {
 	depth       int
 	currentTest string
 	path        string
+	retryDepth  int
+	requireNew  bool
 }
 
 func (v visitor) Visit(n ast.Node) ast.Visitor {
-	// Walk uses DFS so reset when we pop back up
-	if retryDepth > 0 && v.depth <= retryDepth {
-		retryDepth = 0
+	if n != nil {
+		// When called with a non-nil ast.Node, we are delving 1 node deeper into the tree
+		// and therefore should update our tracked depth accordingly.
+		v.depth++
+	} else {
+		// Once a sub-tree of the AST has finished being walked Visit(nil) will be invoked.
+		// There is no need to decrement the depth because we are passing the visitor by
+		// value rather than a reference. The previous visitor on up the stack with the correct
+		// depth would be used for subsequent recursive Visit calls.
+		return v
 	}
 
 	switch node := n.(type) {
 	case *ast.CallExpr:
 		if inRequire(node) {
-			newRequire = true
+			v.requireNew = true
 		}
-		if inRetry(node) {
-			retryDepth = v.depth
+
+		isRetryInvocation := inRetry(node)
+		if isRetryInvocation {
+			v.retryDepth = v.depth
 		}
-		if retryDepth > 0 && tCallsFailer(node.Fun) {
+
+		if v.retryDepth > 0 && tCallsFailer(node.Fun) {
 			rememberTest(v.path, v.currentTest)
 			break
 		}
-		// Flag if we're using require in a retry if:
-		// - require.New(t) was called earlier and assertion does not use 'r'
-		// - t is an argument to require func
-		if retryDepth > 0 && usesRequire(node.Fun) {
-			if (newRequire && !usesParam("r", node)) || usesParam("t", node) {
-				rememberTest(v.path, v.currentTest)
-			}
+		// Flag if we are in a retry.Run(With)? call using a *testing.T
+		if v.retryDepth > 0 && !isRetryInvocation && usesTestingT(node) {
+			rememberTest(v.path, v.currentTest)
 		}
 	case *ast.FuncDecl:
 		name := node.Name.Name
 
 		// Don't filter to test functions, since issue can be in helper func
 		v.currentTest = name
-		newRequire = false // Will only call require.New once per function call
+		v.requireNew = false // Will only call require.New once per function call
 	}
-	v.depth++
 	return v
 }
 
@@ -253,16 +257,46 @@ func usesRequire(fun ast.Expr) bool {
 	return false
 }
 
-// usesParam checks if param is first in a call expression
-func usesParam(param string, ce *ast.CallExpr) bool {
-	// t is always first arg to require when not using require.New
-	firstArg, ok := ce.Args[0].(*ast.Ident)
-	if !ok {
-		return false
+func usesTestingT(ce *ast.CallExpr) bool {
+	for _, raw := range ce.Args {
+		arg, ok := raw.(*ast.Ident)
+		if !ok {
+			continue
+		}
+
+		if arg.Obj == nil || arg.Obj.Kind != ast.Var {
+			continue
+		}
+
+		field, ok := arg.Obj.Decl.(*ast.Field)
+		if !ok {
+			continue
+		}
+
+		ptr, ok := field.Type.(*ast.StarExpr)
+		if !ok {
+			continue
+		}
+
+		sel, ok := ptr.X.(*ast.SelectorExpr)
+		if !ok {
+			continue
+		}
+
+		if sel.Sel.Name != "T" {
+			continue
+		}
+
+		pkg, ok := sel.X.(*ast.Ident)
+		if !ok {
+			continue
+		}
+
+		if pkg.Name == "testing" {
+			return true
+		}
 	}
-	if firstArg.Name == param {
-		return true
-	}
+
 	return false
 }
 
