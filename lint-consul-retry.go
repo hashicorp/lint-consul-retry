@@ -15,7 +15,7 @@ import (
 )
 
 var (
-	broken  = make(map[string]map[string]struct{}) // Stored in a map for deduplication file->test-><nop>
+	broken  = make(map[string]map[string][]token.Pos) // Stored in a map for deduplication file->test-><nop>
 	fset    = token.NewFileSet()
 	failers = map[string]bool{
 		"Error":   true,
@@ -28,7 +28,8 @@ var (
 )
 
 const (
-	retryPath = `"github.com/hashicorp/consul/sdk/testutil/retry"`
+	retryPath   = `"github.com/hashicorp/consul/sdk/testutil/retry"`
+	testingPath = `"testing"`
 )
 
 func main() {
@@ -46,7 +47,7 @@ func run() (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to get cwd: %w", err)
 	}
-	if err := walkDir(dir); err != nil {
+	if err := filepath.Walk(dir, visitFile); err != nil {
 		return 0, fmt.Errorf("failed to walk directory: %w", err)
 	}
 	if len(broken) > 0 {
@@ -61,6 +62,10 @@ func run() (int, error) {
 			testList := broken[path]
 			for _, test := range keys(testList) {
 				os.Stderr.WriteString(fmt.Sprintf("    %s\n", test))
+				for _, pos := range testList[test] {
+					p := fset.Position(pos)
+					os.Stderr.WriteString(fmt.Sprintf("      %s\n", p.String()))
+				}
 			}
 		}
 		return 1, nil
@@ -77,13 +82,13 @@ func keys[V any](m map[string]V) []string {
 	return out
 }
 
-func rememberTest(path, test string) {
+func rememberTest(path, test string, pos token.Pos) {
 	testList, ok := broken[path]
 	if !ok {
-		testList = make(map[string]struct{})
+		testList = make(map[string][]token.Pos)
 		broken[path] = testList
 	}
-	testList[test] = struct{}{}
+	testList[test] = append(testList[test], pos)
 }
 
 type visitor struct {
@@ -91,7 +96,6 @@ type visitor struct {
 	currentTest string
 	path        string
 	retryDepth  int
-	requireNew  bool
 }
 
 func (v visitor) Visit(n ast.Node) ast.Visitor {
@@ -109,35 +113,36 @@ func (v visitor) Visit(n ast.Node) ast.Visitor {
 
 	switch node := n.(type) {
 	case *ast.CallExpr:
-		if inRequire(node) {
-			v.requireNew = true
-		}
+		// Track whether we are in a retry block already. This is for the special case
+		// of nested retry blocks which likely not a great idea but regardless we want
+		// to catch incorrect usage of *testing.T.
+		retrying := v.retryDepth > 0
 
-		isRetryInvocation := inRetry(node)
-		if isRetryInvocation {
+		// Is the current function call invoking a retry. If so record the latest retry depth.
+		// Note that this explicitly does not set retrying to true because that function invocation
+		// SHOULD use the *testing.T.
+		if inRetry(node) {
 			v.retryDepth = v.depth
 		}
 
-		if v.retryDepth > 0 && tCallsFailer(node.Fun) {
-			rememberTest(v.path, v.currentTest)
-			break
-		}
-		// Flag if we are in a retry.Run(With)? call using a *testing.T
-		if v.retryDepth > 0 && !isRetryInvocation && usesTestingT(node) {
-			rememberTest(v.path, v.currentTest)
+		// Alert if we are using a *testing.T within a retry.Run* invocation.
+		//
+		// This will catch uses of methods on the object such as calling t.Fail() and will
+		// also catch passing the *testing.T as an argument to another function.
+		if retrying && usesTestingT(node) {
+			rememberTest(v.path, v.currentTest, node.Pos())
 		}
 	case *ast.FuncDecl:
-		name := node.Name.Name
-
-		// Don't filter to test functions, since issue can be in helper func
-		v.currentTest = name
-		v.requireNew = false // Will only call require.New once per function call
+		// Record the function name for reporting when the functions code fails linting. Note
+		// that we don't want to filter to test functions only as sub-tests and helpers could
+		// be where the incorrect *testing.T usage comes from
+		v.currentTest = node.Name.Name
 	}
 	return v
 }
 
-// impportsRetry if the source file imports retry pkg
-func importsRetry(file *ast.File) bool {
+// importsPackage will check if the given file imports the package with the specified path
+func importsPackage(file *ast.File, importPkg string) bool {
 	var specs []ast.Spec
 
 	for _, decl := range file.Decls {
@@ -151,14 +156,14 @@ func importsRetry(file *ast.File) bool {
 			continue
 		}
 		path := pkg.Path.Value
-		if path == retryPath {
+		if path == importPkg {
 			return true
 		}
 	}
 	return false
 }
 
-// inRetry if an expression is a call to retry.Run(t func(r *retry.R){...})
+// inRetry returns true if an expression is a call to retry.Run(t func(r *retry.R){...})
 func inRetry(ce *ast.CallExpr) bool {
 	function, ok := ce.Fun.(*ast.SelectorExpr)
 	if !ok {
@@ -199,65 +204,50 @@ func inRetry(ce *ast.CallExpr) bool {
 	return false
 }
 
-// inRequire if expression is a call to require.New(t)
-func inRequire(ce *ast.CallExpr) bool {
-	function, ok := ce.Fun.(*ast.SelectorExpr)
+// objectIsTestingT is a helper method to identify that an object is a concreate *testing.T type.
+func objectIsTestingT(obj *ast.Object) bool {
+	if obj == nil {
+		return false
+	}
+
+	field, ok := obj.Decl.(*ast.Field)
 	if !ok {
 		return false
 	}
-	pkg, ok := function.X.(*ast.Ident)
+
+	ptr, ok := field.Type.(*ast.StarExpr)
 	if !ok {
 		return false
 	}
-	if len(ce.Args) == 0 {
-		return false
-	}
-	firstArg, ok := ce.Args[0].(*ast.Ident)
+
+	sel, ok := ptr.X.(*ast.SelectorExpr)
 	if !ok {
 		return false
 	}
-	if !(pkg.Name == "require" || pkg.Name == "assert") {
+
+	if sel.Sel.Name != "T" {
 		return false
 	}
-	if function.Sel.Name == "New" && firstArg.Name == "t" {
-		return true
+
+	pkg, ok := sel.X.(*ast.Ident)
+	if !ok {
+		return false
 	}
-	return false
+
+	return pkg.Name == "testing"
 }
 
-// tCallsFailer checks if expression is a call to t.[Fail|Fatal|Error]
-func tCallsFailer(fun ast.Expr) bool {
-	function, ok := fun.(*ast.SelectorExpr)
-	if !ok {
-		return false
-	}
-	pkg, ok := function.X.(*ast.Ident)
-	if !ok {
-		return false
-	}
-	if pkg.Name == "t" && failers[function.Sel.Name] {
-		return true
-	}
-	return false
-}
-
-// usesRequire checks if a function call uses require/assert
-func usesRequire(fun ast.Expr) bool {
-	function, ok := fun.(*ast.SelectorExpr)
-	if !ok {
-		return false
-	}
-	pkg, ok := function.X.(*ast.Ident)
-	if !ok {
-		return false
-	}
-	if pkg.Name == "assert" || pkg.Name == "require" {
-		return true
-	}
-	return false
-}
-
+// usesTestingT will check if a *testing.T is passed as an argument to the
+// call or whether the CallExpr represents the invocation of a method on
+// the *testing.T type itself.
 func usesTestingT(ce *ast.CallExpr) bool {
+	if sel, ok := ce.Fun.(*ast.SelectorExpr); ok {
+		receiver, ok := sel.X.(*ast.Ident)
+		if ok && objectIsTestingT(receiver.Obj) {
+			return true
+		}
+	}
+
 	for _, raw := range ce.Args {
 		arg, ok := raw.(*ast.Ident)
 		if !ok {
@@ -268,31 +258,7 @@ func usesTestingT(ce *ast.CallExpr) bool {
 			continue
 		}
 
-		field, ok := arg.Obj.Decl.(*ast.Field)
-		if !ok {
-			continue
-		}
-
-		ptr, ok := field.Type.(*ast.StarExpr)
-		if !ok {
-			continue
-		}
-
-		sel, ok := ptr.X.(*ast.SelectorExpr)
-		if !ok {
-			continue
-		}
-
-		if sel.Sel.Name != "T" {
-			continue
-		}
-
-		pkg, ok := sel.X.(*ast.Ident)
-		if !ok {
-			continue
-		}
-
-		if pkg.Name == "testing" {
+		if objectIsTestingT(arg.Obj) {
 			return true
 		}
 	}
@@ -300,16 +266,15 @@ func usesTestingT(ce *ast.CallExpr) bool {
 	return false
 }
 
-func walkDir(path string) error {
-	return filepath.Walk(path, visitFile)
-}
-
 func visitFile(path string, f os.FileInfo, err error) error {
 	if err != nil {
 		return fmt.Errorf("failed to visit '%s', %v", path, err)
 	}
 
-	if !isGoTestFile(path, f) {
+	// Note that we do not want to restrict to _test.go files only as there
+	// can be retry issues non _test.go files in test-only packages. Instead
+	// we will check if the package imports "testing".
+	if !isGoFile(path, f) {
 		return nil
 	}
 
@@ -319,7 +284,7 @@ func visitFile(path string, f os.FileInfo, err error) error {
 	}
 
 	// Only process files importing sdk/testutil/retry
-	if importsRetry(tree) {
+	if importsPackage(tree, retryPath) && importsPackage(tree, testingPath) {
 		v := visitor{path: path}
 		ast.Walk(v, tree)
 	}
@@ -332,8 +297,4 @@ func isGoFile(path string, f os.FileInfo) bool {
 		return false
 	}
 	return strings.HasSuffix(path, ".go")
-}
-
-func isGoTestFile(path string, f os.FileInfo) bool {
-	return isGoFile(path, f) && strings.HasSuffix(path, "_test.go")
 }
