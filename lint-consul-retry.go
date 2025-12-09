@@ -1,4 +1,4 @@
-// Copyright (c) HashiCorp, Inc.
+// Copyright IBM Corp. 2019, 2023
 // SPDX-License-Identifier: Apache-2.0
 
 package main
